@@ -6,14 +6,15 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
 # ─── Defaults ─────────────────────────────────────────────
 PACKAGE="@dtsl/crm-common-components"
-VERSION=""; TASK_ID=""; DRY_RUN=false; SKIP_INSTALL=false
+VERSION=""; TASK_ID=""; DRY_RUN=false; SKIP_INSTALL=false; FORCE_INSTALL=false
 
 usage() {
   printf "\n  Usage: %s <version> <task-id> [options]\n\n" "$(basename "$0")"
   printf "  Options:\n"
   printf "    --package <name>   Package to update (default: @dtsl/crm-common-components)\n"
   printf "    --dry-run          Preview changes without applying them\n"
-  printf "    --skip-install     Skip yarn install\n\n"
+  printf "    --skip-install     Skip yarn install\n"
+  printf "    --force-install    Run yarn install --force\n\n"
   printf "  Examples:\n"
   printf "    %s 4.76.3 1234\n" "$(basename "$0")"
   printf "    %s 4.76.3 1234 --dry-run\n" "$(basename "$0")"
@@ -23,9 +24,10 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run)      DRY_RUN=true ;;
-    --skip-install) SKIP_INSTALL=true ;;
-    --package)      PACKAGE="$2"; shift ;;
+    --dry-run)        DRY_RUN=true ;;
+    --skip-install)   SKIP_INSTALL=true ;;
+    --force-install)  FORCE_INSTALL=true ;;
+    --package)        PACKAGE="$2"; shift ;;
     -h|--help)      usage ;;
     -*)             printf "  Unknown flag: %s\n" "$1"; usage ;;
     *)  [ -z "$VERSION" ] && VERSION="$1" || TASK_ID="$1" ;;
@@ -37,8 +39,9 @@ done
 PACKAGE_SHORT="${PACKAGE##*/}"
 BRANCH="CRM-${TASK_ID}-update-${PACKAGE_SHORT}"
 BREVO_DIR="$(pwd)"
-LOG_FILE="$BREVO_DIR/.update-${PACKAGE_SHORT}-$(date +%Y%m%d-%H%M%S).log"
 TMP_DIR=$(mktemp -d)
+LOG_FILE="$TMP_DIR/run.log"
+ERR_LOG="$BREVO_DIR/.update-${PACKAGE_SHORT}-$(date +%Y%m%d-%H%M%S).log"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 # ─── UI helpers ───────────────────────────────────────────
@@ -103,6 +106,18 @@ GIT_ROOTS=(
 )
 SELECTED=(1 1 1 1 1 1 1 1)
 
+# ─── Pre-compute current branch per git root ──────────────
+declare -A ROOT_BRANCH
+for GR in "app-crm-frontend" "companies-frontend" "tasks-frontend" \
+           "contacts-frontend" "contacts-details-frontend" "deals-frontend"; do
+  REPO="$BREVO_DIR/$GR"
+  if [ -d "$REPO/.git" ]; then
+    ROOT_BRANCH[$GR]=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  else
+    ROOT_BRANCH[$GR]="not cloned"
+  fi
+done
+
 # ─── Header ───────────────────────────────────────────────
 clear
 printf "\n${BOLD}  update-dtsl-dep${NC}\n"
@@ -111,9 +126,9 @@ printf "  Package  : ${CYAN}%s${NC}\n"  "$PACKAGE"
 printf "  Version  : ${CYAN}%s${NC}\n"  "$VERSION"
 printf "  Branch   : ${CYAN}%s${NC}\n"  "$BRANCH"
 printf "  Dir      : ${DIM}%s${NC}\n"   "$BREVO_DIR"
-printf "  Log      : ${DIM}%s${NC}\n"   "$LOG_FILE"
 $DRY_RUN      && printf "  ${YELLOW}Mode     : DRY RUN — no changes will be made${NC}\n"
 $SKIP_INSTALL && printf "  Mode     : --skip-install\n"
+$FORCE_INSTALL && printf "  Mode     : --force-install\n"
 hr
 
 printf "update-dtsl-dep | %s\nPackage: %s | Version: %s | Branch: %s\nDry-run: %s | Dir: %s\n\n" \
@@ -141,10 +156,11 @@ while true; do
   printf "  Toggle: number | ${BOLD}a${NC}=all | ${BOLD}n${NC}=none | ${BOLD}Enter${NC}=confirm\n"
   hr
   for i in "${!NAMES[@]}"; do
+    br="${ROOT_BRANCH[${GIT_ROOTS[$i]}]}"
     if [ "${SELECTED[$i]}" -eq 1 ]; then
-      printf "  ${GREEN}%d) [x]${NC}  %s\n" $((i+1)) "${NAMES[$i]}"
+      printf "  ${GREEN}%d) [x]${NC}  %-44s ${DIM}(%s)${NC}\n" $((i+1)) "${NAMES[$i]}" "$br"
     else
-      printf "  ${DIM}%d) [ ]  %s${NC}\n" $((i+1)) "${NAMES[$i]}"
+      printf "  ${DIM}%d) [ ]  %-44s (%s)${NC}\n" $((i+1)) "${NAMES[$i]}" "$br"
     fi
   done
   printf "\n  > "; read -r inp
@@ -178,54 +194,100 @@ for i in "${!NAMES[@]}"; do
     || printf "  ${DIM}  ○  %s${NC}\n" "${NAMES[$i]}"
 done
 
-# ─── STEP 3/5  Clone missing repos ────────────────────────
-step "Clone missing repos"
+# ─── STEP 3/5  Clone / prepare repos ─────────────────────
+SKIP_ROOTS=()
+step "Clone / prepare repos"
 for GR in "${UNIQUE_ROOTS[@]}"; do
   REPO="$BREVO_DIR/$GR"
   if [ -d "$REPO/.git" ]; then
-    ok "$GR ${DIM}(exists)${NC}"
+    DIRTY=$(git -C "$REPO" status --porcelain 2>/dev/null)
+    CURR_BR=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+    printf "\n  ${CYAN}[%s]${NC}  on ${BOLD}%s${NC}" "$GR" "$CURR_BR"
+    [ -n "$DIRTY" ] && printf "  ${YELLOW}(dirty)${NC}"
+    printf "\n  Stash changes and switch to dev? ${BOLD}[y/N]${NC} "; read -r c
+    if [[ "$c" =~ ^[Yy]$ ]]; then
+      if [ -n "$DIRTY" ]; then
+        start_spinner "Stashing $GR..."
+        git -C "$REPO" stash push -m "auto-stash: update-dtsl-dep $(date +%Y%m%d)" >> "$LOG_FILE" 2>&1
+        stop_spinner; ok "Stashed $(printf "%s\n" "$DIRTY" | wc -l | tr -d ' ') change(s)"
+      fi
+      start_spinner "Switching to dev..."
+      if git -C "$REPO" checkout dev >> "$LOG_FILE" 2>&1; then
+        stop_spinner
+        start_spinner "Pulling dev..."
+        git -C "$REPO" pull origin dev >> "$LOG_FILE" 2>&1
+        stop_spinner; ok "$GR — on dev, pulled"
+      elif git -C "$REPO" checkout main >> "$LOG_FILE" 2>&1; then
+        stop_spinner
+        start_spinner "Pulling main..."
+        git -C "$REPO" pull origin main >> "$LOG_FILE" 2>&1
+        stop_spinner; warn "$GR — dev not found, on main, pulled"
+      else
+        stop_spinner; warn "$GR — could not switch to dev or main, staying on $CURR_BR"
+      fi
+    else
+      if [ -n "$DIRTY" ]; then
+        COUNT=$(printf "%s\n" "$DIRTY" | wc -l | tr -d ' ')
+        warn "$GR — $COUNT uncommitted change(s). Continue with dirty state? ${BOLD}[y/N]${NC} "; read -r d
+        if [[ "$d" =~ ^[Yy]$ ]]; then
+          ok "$GR — using $CURR_BR (with uncommitted changes)"
+        else
+          warn "$GR — skipped"
+          SKIP_ROOTS+=("$GR"); continue
+        fi
+      else
+        ok "$GR — using current branch $CURR_BR"
+      fi
+    fi
   else
     start_spinner "Cloning $GR..."
-    if git clone "https://github.com/DTSL/${GR}" "$REPO" >> "$LOG_FILE" 2>&1; then
-      stop_spinner; ok "$GR ${DIM}(cloned)${NC}"
+    cloned=false
+    for try_branch in dev main; do
+      git clone --branch "$try_branch" "https://github.com/DTSL/${GR}" "$REPO" >> "$LOG_FILE" 2>&1 \
+        && { cloned=true; break; } || rm -rf "$REPO"
+    done
+    $cloned || { git clone "https://github.com/DTSL/${GR}" "$REPO" >> "$LOG_FILE" 2>&1 && cloned=true; }
+    if $cloned; then
+      stop_spinner
+      CLONED_BR=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+      ok "$GR ${DIM}(cloned on ${CLONED_BR})${NC}"
     else
-      stop_spinner; fail "Failed to clone $GR — check GitHub access"; exit 1
+      stop_spinner; fail "Failed to clone $GR — check GitHub access"
+      cp "$LOG_FILE" "$ERR_LOG" 2>/dev/null && printf "  ${DIM}Log: %s${NC}\n" "$ERR_LOG"; exit 1
     fi
   fi
 done
 
+# Remove repos the user skipped during prepare step
+NEW_ROOTS=()
+for r in "${UNIQUE_ROOTS[@]}"; do
+  skip=0; for s in "${SKIP_ROOTS[@]}"; do [ "$r" = "$s" ] && skip=1 && break; done
+  [ "$skip" -eq 0 ] && NEW_ROOTS+=("$r")
+done
+UNIQUE_ROOTS=("${NEW_ROOTS[@]}")
+[ ${#UNIQUE_ROOTS[@]} -eq 0 ] && { warn "No repos to process. Exiting."; exit 0; }
+
 # ─── STEP 4/5  Safety checks ──────────────────────────────
 step "Safety checks"
-DIRTY_ROOTS=(); SKIP_ROOTS=()
 
 for GR in "${UNIQUE_ROOTS[@]}"; do
   REPO="$BREVO_DIR/$GR"
 
-  # Skip if all selected package.json files already have the target version
+  # Skip if all selected package.json files already have the target version committed
   already=true
   for i in "${!PKG_PATHS[@]}"; do
     [ "${SELECTED[$i]}" -ne 1 ] && continue
     [ "${GIT_ROOTS[$i]}" != "$GR" ] && continue
-    grep -q "\"${PACKAGE}\": \"${VERSION}\"" "$BREVO_DIR/${PKG_PATHS[$i]}" 2>/dev/null \
+    rel_path="${PKG_PATHS[$i]#"$GR/"}"
+    git -C "$REPO" show HEAD:"$rel_path" 2>/dev/null \
+      | grep -q "\"${PACKAGE}\": \"${VERSION}\"" \
       || { already=false; break; }
   done
   if $already; then
-    warn "$GR — already on ${CYAN}${VERSION}${NC}, will skip"
-    SKIP_ROOTS+=("$GR"); continue
-  fi
-
-  # Check for uncommitted/unstaged changes
-  DIRTY=$(cd "$REPO" && git status --porcelain 2>/dev/null)
-  if [ -n "$DIRTY" ]; then
-    COUNT=$(printf "%s\n" "$DIRTY" | wc -l | tr -d ' ')
-    warn "$GR — ${YELLOW}${COUNT} uncommitted change(s):${NC}"
-    printf "%s\n" "$DIRTY" | head -5 | while read -r line; do
-      printf "     ${DIM}%s${NC}\n" "$line"
-    done
-    [ "$COUNT" -gt 5 ] && printf "     ${DIM}(+%d more)${NC}\n" $((COUNT-5))
-    DIRTY_ROOTS+=("$GR")
+    warn "$GR — already on ${CYAN}${VERSION}${NC} (committed), will skip"
+    SKIP_ROOTS+=("$GR")
   else
-    ok "$GR — clean"
+    ok "$GR — ready"
   fi
 done
 
@@ -239,12 +301,6 @@ UNIQUE_ROOTS=("${NEW_ROOTS[@]}")
 
 if [ ${#UNIQUE_ROOTS[@]} -eq 0 ]; then
   printf "\n"; ok "All selected repos already on ${VERSION}. Nothing to do."; exit 0
-fi
-
-# Confirm if any dirty repos
-if [ ${#DIRTY_ROOTS[@]} -gt 0 ]; then
-  printf "\n  ${YELLOW}${#DIRTY_ROOTS[@]} repo(s) have uncommitted changes.${NC} Proceed anyway? ${BOLD}[y/N]${NC} "
-  read -r c; [[ "$c" =~ ^[Yy]$ ]] || { printf "  Aborted.\n"; exit 0; }
 fi
 
 # ─── STEP 5/5  Update → branch → install → commit → push ──
@@ -267,17 +323,6 @@ if $DRY_RUN; then
   printf "\n"; ok "Dry run complete — no changes made."; exit 0
 fi
 
-# Update package.json files
-for i in "${!PKG_PATHS[@]}"; do
-  [ "${SELECTED[$i]}" -ne 1 ] && continue
-  skip=0; for s in "${SKIP_ROOTS[@]}"; do [ "${GIT_ROOTS[$i]}" = "$s" ] && skip=1 && break; done
-  [ "$skip" -ne 0 ] && continue
-  PKG="$BREVO_DIR/${PKG_PATHS[$i]}"
-  sed -i '' "s|\"${PACKAGE}\": \"[^\"]*\"|\"${PACKAGE}\": \"${VERSION}\"|" "$PKG"
-  info "Updated ${PKG_PATHS[$i]}"
-done
-printf "\n"
-
 # Parallel git ops — one subshell per git root
 for GR in "${UNIQUE_ROOTS[@]}"; do
   # Snapshot files to stage before spawning subshell
@@ -294,39 +339,86 @@ for GR in "${UNIQUE_ROOTS[@]}"; do
     _l() { printf "%s [%s] %s\n" "$(date +%H:%M:%S)" "$GR" "$*" >> "$LOG_FILE"; }
     _p() { printf "  ${CYAN}[%s]${NC} %s\n" "$GR" "$*"; _l "$*"; }
 
-    # Pull latest default branch
-    _p "Pulling latest..."
-    DEFAULT_BR=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
-      | sed 's@^refs/remotes/origin/@@' || echo "main")
-    git pull origin "$DEFAULT_BR" >> "$LOG_FILE" 2>&1 \
-      || _p "⚠ pull failed — continuing on current state"
+    # Update package.json files (while still on current branch / dev)
+    for f in "${FILES[@]}"; do
+      sed -i '' "s|\"${PACKAGE}\": \"[^\"]*\"|\"${PACKAGE}\": \"${VERSION}\"|" "$REPO/$f"
+      _p "Updated $f"
+    done
 
-    # Create feature branch
-    _p "Creating branch ${BRANCH}..."
-    git checkout -b "$BRANCH" >> "$LOG_FILE" 2>&1 \
-      || { echo "failed|branch already exists — try a different task ID" > "$SF"; exit 0; }
+    # Create feature branch (skip if already on it)
+    CURR_BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    BRANCH_NEW=true
+    if [ "$CURR_BR" = "$BRANCH" ]; then
+      _p "Already on ${BRANCH}, skipping branch creation"
+      BRANCH_NEW=false
+    else
+      _p "Creating branch ${BRANCH}..."
+      branch_out=$(git checkout -b "$BRANCH" 2>&1)
+      echo "$branch_out" >> "$LOG_FILE"
+      if [ $? -ne 0 ]; then
+        reason=$(echo "$branch_out" | grep -v '^$' | tail -1)
+        echo "failed|branch already exists — try a different task ID${reason:+ ($reason)}" > "$SF"; exit 0
+      fi
+    fi
 
     # yarn install
     if ! $SKIP_INSTALL; then
-      _p "Running yarn install..."
+      YARN_FLAGS=""; $FORCE_INSTALL && YARN_FLAGS="--force"
+      _p "Running yarn install${YARN_FLAGS:+ $YARN_FLAGS}..."
       [ -d "node_modules/${PACKAGE}" ] && chmod -R u+w "node_modules/${PACKAGE}" 2>/dev/null || true
-      yarn install >> "$LOG_FILE" 2>&1 \
-        || { echo "failed|yarn install failed — check log for details" > "$SF"; exit 0; }
+      yarn_out=$(yarn install $YARN_FLAGS 2>&1)
+      echo "$yarn_out" >> "$LOG_FILE"
+      if [ $? -ne 0 ]; then
+        reason=$(echo "$yarn_out" | grep -i "error\|failed" | grep -v "^$" | tail -1 | sed 's/^[[:space:]]*//')
+        echo "failed|yarn install failed${reason:+ — $reason}" > "$SF"; exit 0
+      fi
     fi
 
     # Commit
     _p "Committing..."
     git add "${FILES[@]}" >> "$LOG_FILE" 2>&1
     [ -f yarn.lock ] && git add yarn.lock >> "$LOG_FILE" 2>&1
-    git commit -m "chore: update ${PACKAGE} to ${VERSION}" >> "$LOG_FILE" 2>&1 \
-      || { echo "failed|nothing to commit" > "$SF"; exit 0; }
+    commit_out=$(git commit -m "chore: update ${PACKAGE} to ${VERSION}" 2>&1)
+    echo "$commit_out" >> "$LOG_FILE"
+    if [ $? -ne 0 ]; then
+      reason=$(echo "$commit_out" | grep -v '^$' | tail -1 | sed 's/^[[:space:]]*//')
+      echo "failed|nothing to commit${reason:+ ($reason)}" > "$SF"; exit 0
+    fi
 
     # Push
     _p "Pushing ${BRANCH}..."
-    git push -u origin "$BRANCH" >> "$LOG_FILE" 2>&1 \
-      || { echo "failed|push failed — check auth or remote" > "$SF"; exit 0; }
+    push_out=$(git push -u origin "$BRANCH" 2>&1)
+    echo "$push_out" >> "$LOG_FILE"
+    if [ $? -ne 0 ]; then
+      reason=$(echo "$push_out" | grep -i "error\|rejected\|failed" | grep -v "^$" | tail -1 | sed 's/^[[:space:]]*//')
+      echo "failed|push failed${reason:+ — $reason}" > "$SF"; exit 0
+    fi
 
-    echo "success|" > "$SF"
+    # Create draft PR (skip if one already exists for this branch)
+    _p "Creating draft PR..."
+    existing_pr=$(gh api "repos/DTSL/${GR}/pulls?head=DTSL:${BRANCH}&state=open" \
+      --jq '.[0].html_url' 2>/dev/null)
+    if [ -n "$existing_pr" ] && [ "$existing_pr" != "null" ]; then
+      PR_URL="$existing_pr"
+      _p "PR already exists: $PR_URL"
+    else
+      PR_URL=$(gh api "repos/DTSL/${GR}/pulls" \
+        --method POST \
+        -f title="CRM-${TASK_ID}: update ${PACKAGE_SHORT} to version ${VERSION}" \
+        -f body="" \
+        -f head="${BRANCH}" \
+        -f base="dev" \
+        -F draft=true \
+        --jq '.html_url' 2>>"$LOG_FILE")
+      if [ -n "$PR_URL" ] && [ "$PR_URL" != "null" ]; then
+        _p "Draft PR: $PR_URL"
+      else
+        _p "⚠ Could not create PR — check log"
+        PR_URL=""
+      fi
+    fi
+
+    $BRANCH_NEW && echo "success|new|${PR_URL}" > "$SF" || echo "success|existing|${PR_URL}" > "$SF"
     _p "✓ Done"
   ) &
 done
@@ -345,12 +437,17 @@ for GR in "${UNIQUE_ROOTS[@]}"; do
   SF="$TMP_DIR/${GR//\//_}"
   if [ -f "$SF" ]; then
     ST=$(cut -d'|' -f1 "$SF")
-    ERR=$(cut -d'|' -f2- "$SF")
+    BR_ST=$(cut -d'|' -f2 "$SF")
+    PR_URL=$(cut -d'|' -f3 "$SF")
     if [ "$ST" = "success" ]; then
-      printf "  %-44s  ${GREEN}✓ pushed → %s${NC}\n" "$GR" "$BRANCH"
+      [ "$BR_ST" = "new" ] \
+        && printf "  %-44s  ${GREEN}✓ pushed → %s${NC}\n" "$GR" "$BRANCH" \
+        || printf "  %-44s  ${GREEN}✓ pushed to existing %s${NC}\n" "$GR" "$BRANCH"
+      [ -n "$PR_URL" ] \
+        && printf "  %-44s    ${DIM}%s${NC}\n" "" "$PR_URL"
       SUCCESS=$((SUCCESS+1))
     else
-      printf "  %-44s  ${RED}✗ %s${NC}\n" "$GR" "$ERR"
+      printf "  %-44s  ${RED}✗ %s${NC}\n" "$GR" "$BR_ST"
       FAILED=$((FAILED+1))
     fi
   fi
@@ -365,4 +462,8 @@ printf "\n"
 [ "$SUCCESS" -gt 0 ] && printf "  ${GREEN}${SUCCESS} pushed${NC}   "
 [ "$FAILED"  -gt 0 ] && printf "  ${RED}${FAILED} failed${NC}   "
 [ "$SKIPPED" -gt 0 ] && printf "  ${YELLOW}${SKIPPED} skipped${NC}"
-printf "\n  ${DIM}Log: %s${NC}\n\n" "$LOG_FILE"
+printf "\n"
+if [ "$FAILED" -gt 0 ]; then
+  cp "$LOG_FILE" "$ERR_LOG" 2>/dev/null && printf "  ${DIM}Log: %s${NC}\n" "$ERR_LOG"
+fi
+printf "\n"
